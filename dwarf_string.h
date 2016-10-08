@@ -3,7 +3,7 @@
 
 #include <unordered_map>
 
-#include <dwarf.h>
+#include "dwarf.h"
 
 /* DWARF tags.  */
 static const std::unordered_map<int, const char*> DWARF_TAG_MAP = {

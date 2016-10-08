@@ -1092,7 +1092,7 @@ bool ReadElf(const char* filename) {
     return false;
   }
   if (!reader.ReadDebugInfoSection()) {
-    return false;
+    fprintf(stderr, "can't read .debug_info\n");
   }
   if (!reader.ReadEhFrameSection()) {
     return false;
