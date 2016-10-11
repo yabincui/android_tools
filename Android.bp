@@ -1,0 +1,37 @@
+
+cc_binary {
+  name: "unwind",
+  host_supported: true,
+  device_supported: true,
+  srcs: ["unwind.cpp", "elf_reader.cpp", "map.cpp"],
+  arch: {
+    x86_64: {
+      srcs: [
+        "GetCurrentRegs_x86_64.S",
+      ],
+    },
+    x86: {
+      srcs: [
+        "GetCurrentRegs_x86.S",
+      ],
+    },
+    arm64: {
+      srcs: [
+        "GetCurrentRegs_aarch64.S",
+      ],
+    },
+    arm: {
+      srcs: [
+        "GetCurrentRegs_arm.S",
+      ],
+    },
+  },
+  cppflags: [ "-std=c++11", "-g"],
+  
+  compile_multilib: "both",
+  multilib: {
+    lib32: {
+      suffix: "32",
+    },
+  },
+}

@@ -1,4 +1,4 @@
-all: app test_exception read_cfi unwind
+all: app test_exception read_cfi unwind unwind32 readelf
 
 app: throw.cpp cxxabi.cpp main.c Makefile
 	g++ -c -o throw.o -O0 -ggdb throw.cpp
@@ -18,13 +18,27 @@ test_exception: test_exception.cpp test_exception_lib.cpp Makefile
 read_cfi: read_cfi.cpp Makefile dwarf_string.h
 	g++ -std=c++11 -o read_cfi read_cfi.cpp
 
-CPPFLAGS := -std=c++11
+readelf: readelf.o elf_reader.o
+	g++ -std=c++11 -o $@ $^
 
-unwind: unwind.o get_mcontext_x86_64.o elf_reader.o map.o
-	g++ -o unwind $^
+CPPFLAGS := -std=c++11 -g
 
-%.o : %.cpp
+unwind: unwind.o GetCurrentRegs_x86_64.o elf_reader.o map.o
+	g++ -o $@ $^
+
+unwind32: unwind_32.o GetCurrentRegs_x86_32.o elf_reader_32.o map_32.o
+	g++ -m32 -o $@ $^
+
+
+%_32.o : %.cpp Makefile
+	g++ -m32 $(CPPFLAGS) -c -o $@ $<
+
+%_32.o : %.S Makefile
+	g++ -m32 -c -o $@ $<
+
+
+%.o : %.cpp Makefile
 	g++ $(CPPFLAGS) -c -o $@ $<
 
-%.o : %.S
+%.o : %.S Makefile
 	g++ -c -o $@ $<

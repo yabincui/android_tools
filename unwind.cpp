@@ -1,9 +1,10 @@
 #include "unwind.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
-#include <ucontext.h>
 
+#include "dwarf_regmap.h"
 #include "dwarf_string.h"
 #include "elf_reader.h"
 #include "map.h"
@@ -18,9 +19,9 @@
 #define D(format...)
 #endif
 
-static constexpr int MAX_REGS = 64;
+static constexpr int MAX_REGS = 32;
 
-enum class RegState {
+enum class RegStateType {
   UNDEFINED,
   SAME_VALUE,
   OFFSET_N,
@@ -31,43 +32,51 @@ enum class RegState {
   ARCHITECTURAL,
 };
 
-struct Reg {
-  RegState state;
+template <class word_t>
+struct RegState {
+  RegStateType type;
   union {
     struct {
-      uint64_t offset;
+      word_t offset;
     } offset_n;
   };
 
- void SetOffsetN(uint64_t offset) {
-   state = RegState::OFFSET_N;
+ void SetOffsetN(word_t offset) {
+   type = RegStateType::OFFSET_N;
    offset_n.offset = offset;
  }
 };
 
+template <typename word_t>
 struct Cfa {
   int regno;
-  uint64_t offset;
+  word_t offset;
 };
 
-static const char* FindMap(const std::unordered_map<int, const char*>& map, uint64_t key) {
-  auto it = map.find(key);
-  if (it != map.end()) {
-    return it->second;
-  }
-  return "";
-}
+template <typename word_t>
+struct RegValue {
+  bool valid;
+  word_t value;
 
-static const char* FindCFAInst(uint8_t inst) {
-  if (inst & 0xc0) {
-    inst &= 0xc0;
+  RegValue() : valid(false), value(0) {
   }
-  return FindMap(DWARF_CFA_INST_MAP, inst);
-}
 
+  RegValue(word_t value) : valid(true), value(value) {
+  }
+
+  void SetValue(word_t value) {
+    valid = true;
+    this->value = value;
+  }
+};
+
+template <typename word_t>
 class CFAExecutor {
  public:
-  void Init(Fde* fde, uint64_t stop_loc) {
+  CFAExecutor(int sp_regno) : sp_regno_(sp_regno) {
+  }
+
+  void Init(Fde* fde, word_t stop_loc) {
     fde_ = fde;
     cie_ = fde->cie;
     if (fde_->section64 != cie_->section64) {
@@ -77,39 +86,84 @@ class CFAExecutor {
     section64_ = cie_->section64;
     stop_loc_ = stop_loc;
     current_loc_ = fde_->func_start;
-    cfa_.regno = 0;
-    cfa_.offset = 0;
+    cfa_.regno = -1;
+    cfa_.offset = (sizeof(word_t) == 4) ? UINT_MAX : ULLONG_MAX;
     for (int i = 0; i < MAX_REGS; ++i) {
-      regs_[i].state = RegState::UNDEFINED;
+      regs_[i].type = RegStateType::UNDEFINED;
     }
     D("CFAExecutor, fde [0x%" PRIx64 "-0x%" PRIx64 "], stop_loc 0x%" PRIx64 "\n",
-      fde_->func_start, fde_->func_end, stop_loc_);
+      fde_->func_start, fde_->func_end, static_cast<uint64_t>(stop_loc_));
   }
 
-  bool Execute();
+  bool Execute(const RegValue<word_t> old_regs[], RegValue<word_t> new_regs[]);
   bool ExecuteInstructions(const std::vector<char>& insts);
 
  private:
+  const int sp_regno_;
   Fde* fde_;
   Cie* cie_;
   bool section64_;
-  uint64_t stop_loc_;
-  uint64_t current_loc_;
-  Cfa cfa_;
-  Reg regs_[MAX_REGS];
+  word_t stop_loc_;
+  word_t current_loc_;
+  Cfa<word_t> cfa_;
+  RegState<word_t> regs_[MAX_REGS];
 };
 
-bool CFAExecutor::Execute() {
+template <typename word_t>
+bool CFAExecutor<word_t>::Execute(const RegValue<word_t> old_regs[], RegValue<word_t> new_regs[]) {
   if (!ExecuteInstructions(cie_->insts)) {
+    fprintf(stderr, "execute cie instructions failed\n");
     return false;
   }
   if (!ExecuteInstructions(fde_->insts)) {
+    fprintf(stderr, "execute fde instructions failed\n");
     return false;
   }
+  if (cfa_.regno == -1 || cfa_.offset == ULLONG_MAX) {
+    fprintf(stderr, "cfa not valid\n");
+    return false;
+  }
+  if (cfa_.regno >= MAX_REGS || !old_regs[cfa_.regno].valid) {
+    fprintf(stderr, "cfa needs unavailable reg %d\n", cfa_.regno);
+    return false;
+  }
+  word_t cfa_value = old_regs[cfa_.regno].value + cfa_.offset;
+  D("cfa reg %d = 0x%" PRIx64 ", offset = 0x%" PRIx64 ", cfa_value = 0x%" PRIx64 "\n",
+    cfa_.regno, static_cast<uint64_t>(old_regs[cfa_.regno].value),
+    static_cast<uint64_t>(cfa_.offset), static_cast<uint64_t>(cfa_value));
+  for (int i = 0; i < MAX_REGS; ++i) {
+    new_regs[i].valid = false;
+  }
+  for (int i = 0; i < MAX_REGS; ++i) {
+    RegStateType type = regs_[i].type;
+    if (type == RegStateType::UNDEFINED) {
+      continue;
+    } else if (type == RegStateType::SAME_VALUE) {
+      if (old_regs[i].valid) {
+        new_regs[i].SetValue(old_regs[i].value);
+      }
+    } else if (type == RegStateType::OFFSET_N) {
+      word_t addr = cfa_value + regs_[i].offset_n.offset;
+      word_t value;
+
+      if (cie_->address_size == 4) {
+        value = *(uint32_t*)addr;
+      } else {
+        value = *(uint64_t*)addr;
+      }
+      new_regs[i].SetValue(value);
+    } else {
+      fprintf(stderr, "unexpected RegStateType %d\n", type);
+      abort();
+    }
+  }
+  // cfa is the sp of the previous frame.
+  new_regs[sp_regno_].SetValue(cfa_value);
   return true;
 }
 
-bool CFAExecutor::ExecuteInstructions(const std::vector<char>& insts) {
+template <typename word_t>
+bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
   const char* begin = insts.data();
   const char* end = begin + insts.size();
   const char* p = begin;
@@ -121,7 +175,7 @@ bool CFAExecutor::ExecuteInstructions(const std::vector<char>& insts) {
       if (t == DW_CFA_advance_loc) {
         uint8_t delta = inst & 0x3f;
         current_loc_ += delta;
-        D("loc = loc + 0x%x = 0x%" PRIx64, delta, current_loc_);
+        D("loc = loc + 0x%x = 0x%" PRIx64, delta, static_cast<uint64_t>(current_loc_));
         if (current_loc_ > stop_loc_) {
           break;
         }
@@ -159,7 +213,7 @@ bool CFAExecutor::ExecuteInstructions(const std::vector<char>& insts) {
             delta = Read(p, 4);
           }
           current_loc_ += delta;
-          D("loc = loc + 0x%u = 0x%" PRIx64, delta, current_loc_);
+          D("loc = loc + 0x%u = 0x%" PRIx64, delta, static_cast<uint64_t>(current_loc_));
           if (current_loc_ > stop_loc_) {
             D("\n");
             return true;
@@ -206,7 +260,7 @@ bool CFAExecutor::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_def_cfa_register: {
           uint64_t reg = ReadULEB128(p);
           cfa_.regno = reg;
-          D("cfa = r%" PRIu64 " + 0x%" PRIx64, reg, cfa_.offset);
+          D("cfa = r%" PRIu64 " + 0x%" PRIx64, reg, static_cast<uint64_t>(cfa_.offset));
           break;
         }
         case DW_CFA_def_cfa_offset: {
@@ -277,8 +331,81 @@ bool CFAExecutor::ExecuteInstructions(const std::vector<char>& insts) {
   }
   return true;
 }
+/*
+struct UnwindStruct {
+  int reg_count;
+  std::unordered_map<int, const char*>& regname_map;
+  int ip_regno;
+  int sp_regno;
+};
 
-extern "C" void GetMContext(mcontext_t* mc);
+static const struct UnwindStruct Unwind_X86_64 {
+  .reg_count = X86_64_REG_COUNT,
+  .regname_map = X86_64_REG_NAME_MAP,
+  .ip_regno = X86_64_RIP,
+  .sp_regno = X86_64_RSP,
+};
+
+static const struct UnwindStruct Unwind_X86 {
+  .reg_count = X86_REG_COUNT,
+  .regname_map = X86_REG_NAME_MAP,
+  .ip_regno = X86_RIP,
+  .sp_regno = X86_RSP,
+};
+
+static const struct UnwindStruct Unwind_AARCH64 {
+  .reg_count = AARCH64_REG_COUNT,
+  .regname_map = AARCH64_REG_NAME_MAP,
+  .ip_regno = AARCH64_RIP,
+  .sp_regno = AARCH64_RSP,
+};
+
+static const struct UnwindStruct Unwind_ARM {
+  .reg_count = ARM_REG_COUNT,
+  .regname_map = ARM_REG_NAME_MAP,
+  .ip_regno = ARM_RIP,
+  .sp_regno = ARM_RSP,
+};
+*/
+
+struct UnwindStruct_X86_64 {
+  static const int reg_count = X86_64_REG_COUNT;
+  static const std::unordered_map<int, const char*>& regname_map;
+  static const int ip_regno = X86_64_RIP;
+  static const int sp_regno = X86_64_RSP;
+  using word_t = uint64_t;
+};
+const std::unordered_map<int, const char*>& UnwindStruct_X86_64::regname_map = X86_64_REG_NAME_MAP;
+
+struct UnwindStruct_X86 {
+  static const int reg_count = X86_REG_COUNT;
+  static const std::unordered_map<int, const char*>& regname_map;
+  static const int ip_regno = X86_EIP;
+  static const int sp_regno = X86_ESP;
+  using word_t = uint32_t;
+};
+const std::unordered_map<int, const char*>& UnwindStruct_X86::regname_map = X86_REG_NAME_MAP;
+
+
+struct UnwindStruct_AARCH64 {
+  static const int reg_count = AARCH64_REG_COUNT;
+  static const std::unordered_map<int, const char*>& regname_map;
+  static const int ip_regno = AARCH64_IP;
+  static const int sp_regno = AARCH64_SP;
+  using word_t = uint64_t;
+};
+const std::unordered_map<int, const char*>& UnwindStruct_AARCH64::regname_map = AARCH64_REG_NAME_MAP;
+
+struct UnwindStruct_ARM {
+  static const int reg_count = ARM_REG_COUNT;
+  static const std::unordered_map<int, const char*>& regname_map;
+  static const int ip_regno = ARM_LR;
+  static const int sp_regno = ARM_SP;
+  using word_t = uint32_t;
+};
+const std::unordered_map<int, const char*>& UnwindStruct_ARM::regname_map = ARM_REG_NAME_MAP;
+
+extern "C" void GetCurrentRegs(void* mc);
 
 // Unwind steps:
 // 1. GetMContext
@@ -287,60 +414,89 @@ extern "C" void GetMContext(mcontext_t* mc);
 // 4. build a virtual table
 // 3. execute dwarf cfa instructions to ip
 // 4. get cfa value and register values
-void Unwind() {
-  mcontext_t mc;
-  GetMContext(&mc);
-  D("r8 0x%llx\n", mc.gregs[REG_R8]);
-  D("r9 0x%llx\n", mc.gregs[REG_R9]);
-  D("r10 0x%llx\n", mc.gregs[REG_R10]);
-  D("r11 0x%llx\n", mc.gregs[REG_R11]);
-  D("r12 0x%llx\n", mc.gregs[REG_R12]);
-  D("r13 0x%llx\n", mc.gregs[REG_R13]);
-  D("r14 0x%llx\n", mc.gregs[REG_R14]);
-  D("r15 0x%llx\n", mc.gregs[REG_R15]);
-  D("rdi 0x%llx\n", mc.gregs[REG_RDI]);
-  D("rsi 0x%llx\n", mc.gregs[REG_RSI]);
-  D("rbp 0x%llx\n", mc.gregs[REG_RBP]);
-  D("rbx 0x%llx\n", mc.gregs[REG_RBX]);
-  D("rdx 0x%llx\n", mc.gregs[REG_RDX]);
-  D("rax 0x%llx\n", mc.gregs[REG_RAX]);
-  D("rcx 0x%llx\n", mc.gregs[REG_RCX]);
-  D("rsp 0x%llx\n", mc.gregs[REG_RSP]);
-  D("rip 0x%llx\n", mc.gregs[REG_RIP]);
+template <typename UnwindStruct>
+bool UnwindInner() {
+  using word_t = typename UnwindStruct::word_t;
+  word_t current_regs[MAX_REGS];
 
-  uint64_t ip = mc.gregs[REG_RIP] - 1;
+  GetCurrentRegs(current_regs);
+
+  RegValue<word_t> reg_values[MAX_REGS];
+
+  for (int i = 0; i < UnwindStruct::reg_count; ++i) {
+    reg_values[i].SetValue(current_regs[i]);
+    D("reg[%s] = 0x%" PRIx64 "\n", FindMap(UnwindStruct::regname_map, i), static_cast<uint64_t>(reg_values[i].value));
+  }
+
   MapTree map_tree;
   map_tree.UpdateMaps();
-  Map* map = map_tree.GetMapForIp(ip);
-  if (map == nullptr) {
-    fprintf(stderr, "can't get map for ip\n");
-    return;
-  }
-  printf("map: [0x%" PRIx64 " - 0x%" PRIx64 "], dso %s\n", map->start, map->end, map->dso.c_str());
-  if (map->dso_reader == nullptr) {
-    map->dso_reader = ElfReaderManager::OpenElf(map->dso);
-    if (map->dso_reader == nullptr) {
-      fprintf(stderr, "failed to read dso %s\n", map->dso.c_str());
-      return;
+
+  RegValue<word_t> reg_values2[MAX_REGS];
+  RegValue<word_t>* rp1 = reg_values;
+  RegValue<word_t>* rp2 = reg_values2;
+  CFAExecutor<word_t> executor(UnwindStruct::sp_regno);
+  while (rp1[UnwindStruct::ip_regno].valid) {
+    word_t ip = rp1[UnwindStruct::ip_regno].value;
+    printf("ip 0x%" PRIx64 "\n", static_cast<uint64_t>(ip));
+    Map* map = map_tree.GetMapForIp(ip);
+    if (map == nullptr) {
+      fprintf(stderr, "can't get map for ip\n");
+      return false;
     }
+    printf("map: [0x%" PRIx64 " - 0x%" PRIx64 "], dso %s\n", map->start, map->end, map->dso.c_str());
+    if (map->dso_reader == nullptr) {
+      map->dso_reader = ElfReaderManager::OpenElf(map->dso);
+      if (map->dso_reader == nullptr) {
+        fprintf(stderr, "failed to read dso %s\n", map->dso.c_str());
+        return false;
+      }
+    }
+    word_t vaddr_in_file = ip - map->start + map->dso_reader->GetMinVaddr();
+    D("vaddr_in_file = 0x%" PRIx64 "\n", static_cast<uint64_t>(vaddr_in_file));
+    if (!map->dso_reader->ReadEhFrame()) {
+      return false;
+    }
+    Fde* fde = map->dso_reader->GetFdeForVaddrInFile(vaddr_in_file);
+    if (fde == nullptr) {
+      fprintf(stderr, "can't get fde for vaddr\n");
+      return false;
+    }
+    D("fde func[0x%" PRIx64 "-0x%" PRIx64 "]\n", fde->func_start, fde->func_end);
+    executor.Init(fde, vaddr_in_file);
+    if (!executor.Execute(rp1, rp2)) {
+      return false;
+    }
+    for (int i = 0; i < MAX_REGS; ++i) {
+      const char* name = FindMap(UnwindStruct::regname_map, i);
+      D("rp2[%s(%d)] = %d, 0x%" PRIx64 "\n", name, i, rp2[i].valid, static_cast<uint64_t>(rp2[i].value));
+    }
+    RegValue<word_t>* tmp = rp1;
+    rp1 = rp2;
+    rp2 = tmp;
   }
-  uint64_t vaddr_in_file = ip - map->start + map->dso_reader->GetMinVaddr();
-  printf("vaddr_in_file = 0x%" PRIx64 "\n", vaddr_in_file);
-  if (!map->dso_reader->ReadEhFrame()) {
-    return;
-  }
-  Fde* fde = map->dso_reader->GetFdeForVaddrInFile(vaddr_in_file);
-  if (fde == nullptr) {
-    fprintf(stderr, "can't get fde for vaddr\n");
-    return;
-  }
-  printf("fde func[0x%" PRIx64 "-0x%" PRIx64 "]\n", fde->func_start, fde->func_end);
-  CFAExecutor executor;
-  executor.Init(fde, vaddr_in_file);
-  executor.Execute();
+  return true;
+}
+
+bool Unwind() {
+#if defined(__x86_64__)
+  return UnwindInner<UnwindStruct_X86_64>();
+#elif defined(__i386__)
+  return UnwindInner<UnwindStruct_X86>();
+#elif defined(__aarch64__)
+  return UnwindInner<UnwindStruct_AARCH64>();
+#elif defined(__arm__)
+  return UnwindInner<UnwindStruct_ARM>();
+#else
+  return false;
+#endif
+}
+
+void funcInBetween() {
+  Unwind();
 }
 
 int main() {
-  Unwind();
+
+  funcInBetween();
   return 0;
 }

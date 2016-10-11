@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "dwarf.h"
+#include "dwarf_string.h"
 
 static inline int64_t ReadLEB128(const char*& p) {
   int64_t result = 0;
@@ -73,9 +74,11 @@ static inline const char* ReadStr(const char*& p) {
   return result;
 }
 
-static inline uint64_t ReadEhEncoding(const char*& p, uint8_t encoding) {
+static inline uint64_t ReadEhEncoding(const char*& p, uint8_t encoding, bool is64) {
   encoding &= 0x0f;
   switch (encoding) {
+    case DW_EH_PE_absptr:
+      return Read(p, is64 ? 8 : 4);
     case DW_EH_PE_omit:
       return 0;
     case DW_EH_PE_uleb128:
@@ -97,6 +100,22 @@ static inline uint64_t ReadEhEncoding(const char*& p, uint8_t encoding) {
   }
   fprintf(stderr, "ReadEhEncoding: unsupported 0x%x\n", encoding);
   abort();
+}
+
+
+static const char* FindMap(const std::unordered_map<int, const char*>& map, uint64_t key) {
+  auto it = map.find(key);
+  if (it != map.end()) {
+    return it->second;
+  }
+  return "";
+}
+
+static const char* FindCFAInst(uint8_t inst) {
+  if (inst & 0xc0) {
+    inst &= 0xc0;
+  }
+  return FindMap(DWARF_CFA_INST_MAP, inst);
 }
 
 #endif  // _UNWIND_READ_UTILS_H_

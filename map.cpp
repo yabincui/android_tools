@@ -5,6 +5,15 @@
 
 #include <vector>
 
+#define DEBUG_MAP
+
+#if defined(DEBUG_MAP)
+#define D(format, ...) \
+    printf(format, ##__VA_ARGS__)
+#else
+#define D(format...)
+#endif
+
 class LineReader {
  public:
   explicit LineReader(FILE* fp) : fp_(fp), buf_(nullptr), bufsize_(0) {
@@ -62,6 +71,7 @@ bool GetThreadMmapsInProcess(std::map<uint64_t, Map>* maps) {
     map.end = end_addr;
     map.dso = execname;
     map.dso_reader = nullptr;
+    D("map [0x%" PRIx64 " - 0x%" PRIx64 "] dso %s, type %s\n", map.start, map.end, execname, type);
   }
   return true;
 }

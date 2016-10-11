@@ -90,7 +90,7 @@ class FdeTable {
 };
 
 class ElfReader {
- private:
+ protected:
   static const int READ_DEBUG_ABBREV_SECTION = 1;
   static const int READ_DEBUG_STR_SECTION = 2;
   static const int READ_DEBUG_INFO_SECTION = 4;
@@ -135,7 +135,7 @@ class ElfReader {
   FdeTable fde_table_;
 
  private:
-  bool ReadMinVaddr() {
+  void ReadMinVaddr() {
     min_vaddr_ = ReadMinVirtualAddress();
   }
 

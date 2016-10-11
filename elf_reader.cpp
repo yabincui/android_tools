@@ -27,14 +27,6 @@ static void PrintHex(const char* p, uint64_t len) {
   printf("\n");
 }
 
-static const char* FindMap(const std::unordered_map<int, const char*>& map, uint64_t key) {
-  auto it = map.find(key);
-  if (it != map.end()) {
-    return it->second;
-  }
-  return "";
-}
-
 static const char* GetProgramHeaderType(int type) {
   static const std::unordered_map<int, const char*> map = {
     {PT_NULL, "PT_NULL"},
@@ -97,6 +89,10 @@ class ElfReaderImpl : public ElfReader {
 
   virtual ~ElfReaderImpl() {
     fclose(fp_);
+  }
+
+  bool Is64() const {
+    return ElfStruct::ELFCLASS == ELFCLASS64;
   }
 
   bool ReadEhFrame() override;
@@ -203,7 +199,7 @@ class ElfReaderImpl : public ElfReader {
       fprintf(stderr, "failed to read file: %s\n", strerror(errno));
       return false;
     }
-    if (rc != size) {
+    if (static_cast<size_t>(rc) != size) {
       fprintf(stderr, "not read fully\n");
       return false;
     }
@@ -268,7 +264,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
         unit_len = len;
       }
       if (unit_len == 0) {
-        printf("<%lx> zero terminator\n", cie_begin - begin);
+        printf("<%lx> zero terminator\n", (unsigned long)(cie_begin - begin));
         continue;
       }
       const char* cie_end = p + unit_len;
@@ -277,8 +273,9 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
         cie_id = DW_CIE_ID_64;
       }
       bool is_cie = (is_eh_frame ? cie_id == 0 : cie_id == DW_CIE_ID_64);
-      printf("\n<%lx> cie_id %" PRIx64 " %s\n", cie_begin - begin, cie_id, is_cie ? "CIE" : "FDE");
+      printf("\n<%lx> cie_id %" PRIx64 " %s\n", (unsigned long)(cie_begin - begin), cie_id, is_cie ? "CIE" : "FDE");
       Cie* cie = nullptr;
+      uint64_t current_loc = 0;
       if (is_cie) {
         cie = cie_table.CreateCie(cie_begin - begin);
         uint8_t version = Read(p, 1);
@@ -287,7 +284,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
         cie->augmentation = augmentation;
         printf("augmentation %s\n", augmentation);
         CHECK(augmentation[0] == '\0' || augmentation[0] == 'z');
-        uint8_t address_size = 8; // ELF32 or ELF64
+        uint8_t address_size = Is64() ? 8 : 4; // ELF32 or ELF64
         if (version >= 4) {
           address_size = Read(p, 1);
           uint8_t segment_size = Read(p, 1);
@@ -319,13 +316,14 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
               uint8_t encoding = Read(p, 1);
               const char* encoding_str = FindMap(DWARF_EH_ENCODING_MAP, encoding);
               printf("personality pointer encoding 0x%x (%s)\n", encoding, encoding_str);
-              uint64_t personality_handler = ReadEhEncoding(p, encoding);
+              uint64_t personality_handler = ReadEhEncoding(p, encoding, Is64());
               printf("personality pointer 0x%" PRIx64 "\n", personality_handler);
             } else if (c == 'L') {
               uint8_t lsda_encoding = Read(p, 1);
               cie->lsda_encoding = lsda_encoding;
               const char* encoding_str = FindMap(DWARF_EH_ENCODING_MAP, lsda_encoding);
               printf("lsda_encoding 0x%x (%s)\n", lsda_encoding, encoding_str);
+            } else if (c == 'S') {
             } else {
               fprintf(stderr, "unexpected augmentation %c\n", c);
               abort();
@@ -333,7 +331,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
           }
         }
         // initial_instructions
-        printf("initial_instructions len 0x%lx\n", cie_end - p);
+        printf("initial_instructions len 0x%lx\n", (unsigned long)(cie_end - p));
       } else {
         uint64_t cie_offset = (is_eh_frame ? p - secbytes - begin - cie_id : cie_id);
         printf("cie_offset 0x%" PRIx64 "\n", cie_offset);
@@ -342,8 +340,8 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
           return false;
         }
         const char* base = p;
-        uint64_t initial_location = ReadEhEncoding(p, cie->fde_pointer_encoding);
-        uint64_t address_range = ReadEhEncoding(p, cie->fde_pointer_encoding);
+        uint64_t initial_location = ReadEhEncoding(p, cie->fde_pointer_encoding, Is64());
+        uint64_t address_range = ReadEhEncoding(p, cie->fde_pointer_encoding, Is64());
         printf("initial_location 0x%" PRIx64 ", address_range 0x%" PRIx64"\n",
                initial_location, address_range);
         uint64_t proc_start = initial_location;
@@ -351,17 +349,170 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
           proc_start += eh_frame_sec->sh_addr + (base - begin);
         }
         printf("proc range [0x%" PRIx64 " - 0x%" PRIx64 "]\n", proc_start, proc_start + address_range);
+        current_loc = proc_start;
         if (cie->augmentation[0] == 'z') {
           uint64_t augmentation_len = ReadULEB128(p);
           printf("augmentation_len %" PRIu64 "\n", augmentation_len);
+          for (int i = 1; cie->augmentation[i] != '\0'; ++i) {
+            if (cie->augmentation[i] == 'L') {
+              uint64_t lsda = ReadEhEncoding(p, cie->lsda_encoding, Is64());
+              printf("lsda 0x%" PRIx64 "\n", lsda);
+            }
+          }
         }
-        if (cie->lsda_encoding) {
-          uint64_t lsda = ReadEhEncoding(p, cie->lsda_encoding);
-          printf("lsda 0x%" PRIx64 "\n", lsda);
-        }
-        printf("instructions len 0x%lx\n", cie_end - p);
+        printf("instructions len 0x%lx\n",
+               (unsigned long)(cie_end - p));
       }
-      p = cie_end;
+      while (p < cie_end) {
+        uint8_t inst = Read(p, 1);
+        printf("inst %s (0x%x): ", FindCFAInst(inst), inst);
+        if (inst & 0xc0) {
+          uint8_t t = inst & 0xc0;
+          if (t == DW_CFA_advance_loc) {
+            uint8_t delta = inst & 0x3f;
+            current_loc += delta;
+            printf("loc = loc + 0x%x = 0x%" PRIx64, delta, current_loc);
+          } else if (t == DW_CFA_offset) {
+            uint8_t reg = inst & 0x3f;
+            uint64_t offset = ReadULEB128(p);
+            int64_t add = offset * cie->data_alignment_factor;
+            if (add >= 0) {
+              printf("r%u = mem(cfa + 0x%" PRIx64 ")", reg, add);
+            } else {
+              printf("r%u = mem(cfa - 0x%" PRIx64 ")", reg, -add);
+            }
+          } else if (t == DW_CFA_restore) {
+            uint8_t reg = inst & 0x3f;
+          }
+        } else {
+          switch (inst) {
+            case DW_CFA_nop: {
+              break;
+            }
+            case DW_CFA_set_loc: {
+              uint64_t addr = Read(p, cie->address_size);
+              break;
+            }
+            case DW_CFA_advance_loc1:
+            case DW_CFA_advance_loc2:
+            case DW_CFA_advance_loc4: {
+              uint32_t delta;
+              if (inst == DW_CFA_advance_loc1) {
+                delta = Read(p, 1);
+              } else if (inst == DW_CFA_advance_loc2) {
+                delta = Read(p, 2);
+              } else {
+                delta = Read(p, 4);
+              }
+              current_loc += delta;
+              printf("loc = loc + 0x%u = 0x%" PRIx64, delta, current_loc);
+              break;
+            }
+            case DW_CFA_offset_extended: {
+              uint64_t reg = ReadULEB128(p);
+              uint64_t offset = ReadULEB128(p);
+              break;
+            }
+            case DW_CFA_restore_extended: {
+              uint64_t reg = ReadULEB128(p);
+              break;
+            }
+            case DW_CFA_undefined: {
+              uint64_t reg = ReadULEB128(p);
+              printf("r%" PRIu64 " = undefined", reg);
+              break;
+            }
+            case DW_CFA_same_value: {
+              uint64_t reg = ReadULEB128(p);
+              break;
+            }
+            case DW_CFA_register: {
+              uint64_t reg1 = ReadULEB128(p);
+              uint64_t reg2 = ReadULEB128(p);
+              break;
+            }
+            case DW_CFA_remember_state: {
+              break;
+            }
+            case DW_CFA_restore_state: {
+              break;
+            }
+            case DW_CFA_def_cfa: {
+              uint64_t reg = ReadULEB128(p);
+              uint64_t offset = ReadULEB128(p);
+              printf("cfa = r%" PRIu64 " + off 0x%" PRIx64, reg, offset);
+              break;
+            }
+            case DW_CFA_def_cfa_register: {
+              uint64_t reg = ReadULEB128(p);
+              printf("cfa = r%" PRIu64 " + old off", reg);
+              break;
+            }
+            case DW_CFA_def_cfa_offset: {
+              uint64_t offset = ReadULEB128(p);
+              printf("cfa = old_reg + off 0x%" PRIx64, offset);
+              break;
+            }
+            case DW_CFA_def_cfa_expression: {
+               uint64_t len = ReadULEB128(p);
+               printf("cfa = ");
+               /*
+               if (!ParseDwarfExpression(p, len, section64, cie->address_size)) {
+                 return false;
+               }
+               */
+               p += len;
+               break;
+            }
+            case DW_CFA_expression: {
+              uint64_t reg = ReadULEB128(p);
+              uint64_t len = ReadULEB128(p);
+              /*
+              if (!ParseDwarfExpression(p, len, section64, cie->address_size)) {
+                return false;
+              }
+              */
+              p += len;
+              break;
+            }
+            case DW_CFA_offset_extended_sf: {
+              uint64_t reg = ReadULEB128(p);
+              int64_t offset = ReadLEB128(p);
+              break;
+            }
+            case DW_CFA_def_cfa_sf: {
+              uint64_t reg = ReadULEB128(p);
+              int64_t offset = ReadLEB128(p);
+              break;
+            }
+            case DW_CFA_def_cfa_offset_sf: {
+              int64_t offset = ReadLEB128(p);
+              break;
+            }
+            case DW_CFA_val_offset: {
+              uint64_t reg = ReadULEB128(p);
+              uint64_t offset = ReadULEB128(p);
+              break;
+            }
+            case DW_CFA_val_offset_sf: {
+              uint64_t reg = ReadULEB128(p);
+              int64_t offset = ReadLEB128(p);
+              break;
+            }
+            case DW_CFA_val_expression: {
+              uint64_t reg = ReadULEB128(p);
+              uint64_t len = ReadULEB128(p);
+              p += len;
+              break;
+            }
+            default: {
+              fprintf(stderr, "unknown cfa inst: 0x%x\n", inst);
+              abort();
+            }
+          }
+        }
+        printf("\n");
+      }
     }
   }
 
@@ -395,7 +546,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
       const char* augmentation = ReadStr(p);
       cie->augmentation = augmentation;
       CHECK(augmentation[0] == '\0' || augmentation[0] == 'z');
-      uint8_t address_size = 8; // ELF32 or ELF64
+      uint8_t address_size = Is64() ? 8 : 4; // ELF32 or ELF64
       if (version >= 4) {
         address_size = Read(p, 1);
         uint8_t segment_size = Read(p, 1);
@@ -419,10 +570,12 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
             cie->fde_pointer_encoding = fde_pointer_encoding;
           } else if (c == 'P') {
             uint8_t encoding = Read(p, 1);
-            uint64_t personality_handler = ReadEhEncoding(p, encoding);
+            uint64_t personality_handler = ReadEhEncoding(p, encoding, Is64());
           } else if (c == 'L') {
             uint8_t lsda_encoding = Read(p, 1);
             cie->lsda_encoding = lsda_encoding;
+          } else if (c == 'S') {
+            // This is a signal frame
           } else {
             fprintf(stderr, "unexpected augmentation %c\n", c);
             abort();
@@ -438,8 +591,8 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
         return false;
       }
       const char* base = p;
-      uint64_t initial_location = ReadEhEncoding(p, cie->fde_pointer_encoding);
-      uint64_t address_range = ReadEhEncoding(p, cie->fde_pointer_encoding);
+      uint64_t initial_location = ReadEhEncoding(p, cie->fde_pointer_encoding, Is64());
+      uint64_t address_range = ReadEhEncoding(p, cie->fde_pointer_encoding, Is64());
       uint64_t proc_start = initial_location;
       if ((cie->fde_pointer_encoding & 0x70) == DW_EH_PE_pcrel) {
         proc_start += eh_frame_sec->sh_addr + (base - begin);
@@ -451,9 +604,11 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
       fde->func_end = proc_start + address_range;
       if (cie->augmentation[0] == 'z') {
         uint64_t augmentation_len = ReadULEB128(p);
-      }
-      if (cie->lsda_encoding) {
-        uint64_t lsda = ReadEhEncoding(p, cie->lsda_encoding);
+        for (int i = 1; cie->augmentation[i] != '\0'; ++i) {
+          if (cie->augmentation[i] == 'L') {
+            uint64_t lsda = ReadEhEncoding(p, cie->lsda_encoding, Is64());
+          }
+        }
       }
       fde->insts.insert(fde->insts.begin(), p, cie_end);
     }
@@ -504,6 +659,6 @@ ElfReader* ElfReaderManager::OpenElf(const std::string& filename) {
   if (it != reader_table_.end()) {
     return it->second.get();
   }
-  reader_table_[filename] = ElfReader::Create(filename.c_str(), -1);
+  reader_table_[filename] = ElfReader::Create(filename.c_str(), 0);
   return reader_table_[filename].get();
 }
