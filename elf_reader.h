@@ -32,6 +32,17 @@ struct Fde {
 
 class CieTable {
  public:
+  CieTable() {
+  }
+
+  void operator=(CieTable&& other) {
+    for (auto& pair : table_) {
+      delete pair.second;
+    }
+    table_ = std::move(other.table_);
+    other.table_.clear();
+  }
+
   ~CieTable() {
     for (auto& pair : table_) {
       delete pair.second;
@@ -63,10 +74,21 @@ class CieTable {
   // Store Cie* instead of Cie, because we don't want Cie pointers to be invalid
   // after inserting new Cies.
   std::unordered_map<uint64_t, Cie*> table_;
+
+  CieTable(const CieTable&) = delete;
+  void operator=(const CieTable&) = delete;
 };
 
 class FdeTable {
  public:
+  FdeTable() {
+  }
+
+  void operator=(FdeTable&& other) {
+    table_ = std::move(other.table_);
+    other.table_.clear();
+  }
+
   Fde* CreateFde(uint64_t func_start) {
     Fde* fde = &table_[func_start];
     fde->cie = nullptr;
@@ -87,6 +109,24 @@ class FdeTable {
  private:
   // From start of function to Fde.
   std::map<uint64_t, Fde> table_;
+
+  FdeTable(const FdeTable&) = delete;
+  void operator=(const FdeTable&) = delete;
+};
+
+class ReadHelper {
+ public:
+  ReadHelper(const char* name) : name_(name) {
+  }
+  virtual ~ReadHelper() {}
+  const char* GetName() const {
+    return name_.c_str();
+  }
+
+  virtual bool ReadFully(void* buf, size_t size, size_t offset) = 0;
+
+ private:
+  const std::string name_;
 };
 
 class ElfReader {
@@ -95,6 +135,8 @@ class ElfReader {
   static const int READ_DEBUG_STR_SECTION = 2;
   static const int READ_DEBUG_INFO_SECTION = 4;
   static const int READ_EH_FRAME_SECTION = 8;
+  static const int READ_DEBUG_FRAME_SECTION = 16;
+  static const int READ_GNU_DEBUG_DATA_SECTION = 32;
 
  public:
   static const int LOG_HEADER = 1;
@@ -103,14 +145,13 @@ class ElfReader {
   static const int LOG_EH_FRAME_SECTION = 8;
   static const int LOG_PROGRAM_HEADERS = 16;
 
-  static std::unique_ptr<ElfReader> Create(const char* filename, int log_flag);
+  static std::unique_ptr<ElfReader> OpenFile(const char* filename, int log_flag);
+  static std::unique_ptr<ElfReader> OpenMem(const std::vector<char>& data,
+                                            const char* mem_name, int log_flag);
 
   virtual ~ElfReader() {
   }
 
-  const char* GetFilename() const {
-    return filename_.c_str();
-  }
   uint64_t GetMinVaddr() const {
     return min_vaddr_;
   }
@@ -119,18 +160,35 @@ class ElfReader {
     return fde_table_.FindFde(vaddr_in_file);
   }
 
+  bool ReadUnwindSection() {
+    if (HasSection(".debug_frame")) {
+      return ReadDebugFrame();
+    } else if (HasSection(".gnu_debugdata")) {
+      return ReadGnuDebugData();
+    } else if (HasSection(".eh_frame")) {
+      return ReadEhFrame();
+    } else {
+      return false;
+    }
+  }
+
   virtual bool ReadEhFrame() = 0;
+  virtual bool ReadDebugFrame() = 0;
+  virtual bool ReadGnuDebugData() = 0;
 
  protected:
-  ElfReader(const char* filename) : filename_(filename), min_vaddr_(0) {
+  static std::unique_ptr<ElfReader> Open(std::unique_ptr<ReadHelper> read_helper,
+                                         int log_flag);
+
+  ElfReader() : min_vaddr_(0) {
   }
 
   virtual bool ReadHeader() = 0;
   virtual bool ReadSecHeaders() = 0;
   virtual bool ReadProgramHeaders() = 0;
   virtual uint64_t ReadMinVirtualAddress() = 0;
+  virtual bool HasSection(const char* name) = 0;
 
-  const std::string filename_;
   CieTable cie_table_;
   FdeTable fde_table_;
 

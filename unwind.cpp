@@ -73,7 +73,8 @@ struct RegValue {
 template <typename word_t>
 class CFAExecutor {
  public:
-  CFAExecutor(int sp_regno) : sp_regno_(sp_regno) {
+  CFAExecutor(int sp_regno, const std::vector<int>& callee_save_regs)
+      : sp_regno_(sp_regno), callee_save_regs_(callee_save_regs) {
   }
 
   void Init(Fde* fde, word_t stop_loc) {
@@ -91,6 +92,9 @@ class CFAExecutor {
     for (int i = 0; i < MAX_REGS; ++i) {
       regs_[i].type = RegStateType::UNDEFINED;
     }
+    for (auto& i : callee_save_regs_) {
+      regs_[i].type = RegStateType::SAME_VALUE;
+    }
     D("CFAExecutor, fde [0x%" PRIx64 "-0x%" PRIx64 "], stop_loc 0x%" PRIx64 "\n",
       fde_->func_start, fde_->func_end, static_cast<uint64_t>(stop_loc_));
   }
@@ -100,6 +104,7 @@ class CFAExecutor {
 
  private:
   const int sp_regno_;
+  const std::vector<int>& callee_save_regs_;
   Fde* fde_;
   Cie* cie_;
   bool section64_;
@@ -111,10 +116,12 @@ class CFAExecutor {
 
 template <typename word_t>
 bool CFAExecutor<word_t>::Execute(const RegValue<word_t> old_regs[], RegValue<word_t> new_regs[]) {
+  D("execute cie insts\n");
   if (!ExecuteInstructions(cie_->insts)) {
     fprintf(stderr, "execute cie instructions failed\n");
     return false;
   }
+  D("execute fde insts\n");
   if (!ExecuteInstructions(fde_->insts)) {
     fprintf(stderr, "execute fde instructions failed\n");
     return false;
@@ -191,6 +198,7 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         }
       } else if (t == DW_CFA_restore) {
         uint8_t reg = inst & 0x3f;
+        abort();
       }
     } else {
       switch (inst) {
@@ -199,6 +207,7 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         }
         case DW_CFA_set_loc: {
           uint64_t addr = Read(p, cie_->address_size);
+          abort();
           break;
         }
         case DW_CFA_advance_loc1:
@@ -223,30 +232,37 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_offset_extended: {
           uint64_t reg = ReadULEB128(p);
           uint64_t offset = ReadULEB128(p);
+          abort();
           break;
         }
         case DW_CFA_restore_extended: {
           uint64_t reg = ReadULEB128(p);
+          abort();
           break;
         }
         case DW_CFA_undefined: {
           uint64_t reg = ReadULEB128(p);
           D("r%" PRIu64 " = undefined", reg);
+          abort();
           break;
         }
         case DW_CFA_same_value: {
           uint64_t reg = ReadULEB128(p);
+          abort();
           break;
         }
         case DW_CFA_register: {
           uint64_t reg1 = ReadULEB128(p);
           uint64_t reg2 = ReadULEB128(p);
+          abort();
           break;
         }
         case DW_CFA_remember_state: {
+          abort();
           break;
         }
         case DW_CFA_restore_state: {
+          abort();
           break;
         }
         case DW_CFA_def_cfa: {
@@ -272,6 +288,7 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_def_cfa_expression: {
            uint64_t len = ReadULEB128(p);
            D("cfa = TODO");
+           abort();
            /*
            if (!ParseDwarfExpression(p, len, section64, cie->address_size)) {
              return false;
@@ -283,6 +300,7 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_expression: {
           uint64_t reg = ReadULEB128(p);
           uint64_t len = ReadULEB128(p);
+          abort();
           /*
           if (!ParseDwarfExpression(p, len, section64, cie->address_size)) {
             return false;
@@ -294,11 +312,13 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_offset_extended_sf: {
           uint64_t reg = ReadULEB128(p);
           int64_t offset = ReadLEB128(p);
+          abort();
           break;
         }
         case DW_CFA_def_cfa_sf: {
           uint64_t reg = ReadULEB128(p);
           int64_t offset = ReadLEB128(p);
+          abort();
           break;
         }
         case DW_CFA_def_cfa_offset_sf: {
@@ -308,17 +328,20 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
         case DW_CFA_val_offset: {
           uint64_t reg = ReadULEB128(p);
           uint64_t offset = ReadULEB128(p);
+          abort();
           break;
         }
         case DW_CFA_val_offset_sf: {
           uint64_t reg = ReadULEB128(p);
           int64_t offset = ReadLEB128(p);
+          abort();
           break;
         }
         case DW_CFA_val_expression: {
           uint64_t reg = ReadULEB128(p);
           uint64_t len = ReadULEB128(p);
           p += len;
+          abort();
           break;
         }
         default: {
@@ -331,42 +354,6 @@ bool CFAExecutor<word_t>::ExecuteInstructions(const std::vector<char>& insts) {
   }
   return true;
 }
-/*
-struct UnwindStruct {
-  int reg_count;
-  std::unordered_map<int, const char*>& regname_map;
-  int ip_regno;
-  int sp_regno;
-};
-
-static const struct UnwindStruct Unwind_X86_64 {
-  .reg_count = X86_64_REG_COUNT,
-  .regname_map = X86_64_REG_NAME_MAP,
-  .ip_regno = X86_64_RIP,
-  .sp_regno = X86_64_RSP,
-};
-
-static const struct UnwindStruct Unwind_X86 {
-  .reg_count = X86_REG_COUNT,
-  .regname_map = X86_REG_NAME_MAP,
-  .ip_regno = X86_RIP,
-  .sp_regno = X86_RSP,
-};
-
-static const struct UnwindStruct Unwind_AARCH64 {
-  .reg_count = AARCH64_REG_COUNT,
-  .regname_map = AARCH64_REG_NAME_MAP,
-  .ip_regno = AARCH64_RIP,
-  .sp_regno = AARCH64_RSP,
-};
-
-static const struct UnwindStruct Unwind_ARM {
-  .reg_count = ARM_REG_COUNT,
-  .regname_map = ARM_REG_NAME_MAP,
-  .ip_regno = ARM_RIP,
-  .sp_regno = ARM_RSP,
-};
-*/
 
 struct UnwindStruct_X86_64 {
   static const int reg_count = X86_64_REG_COUNT;
@@ -374,8 +361,11 @@ struct UnwindStruct_X86_64 {
   static const int ip_regno = X86_64_RIP;
   static const int sp_regno = X86_64_RSP;
   using word_t = uint64_t;
+  static const int PC_ADVANCE = 1;
+  static const std::vector<int>& callee_save_regs;
 };
 const std::unordered_map<int, const char*>& UnwindStruct_X86_64::regname_map = X86_64_REG_NAME_MAP;
+const std::vector<int>& UnwindStruct_X86_64::callee_save_regs = *new std::vector<int>();
 
 struct UnwindStruct_X86 {
   static const int reg_count = X86_REG_COUNT;
@@ -383,9 +373,11 @@ struct UnwindStruct_X86 {
   static const int ip_regno = X86_EIP;
   static const int sp_regno = X86_ESP;
   using word_t = uint32_t;
+  static const int PC_ADVANCE = 1;
+  static const std::vector<int>& callee_save_regs;
 };
 const std::unordered_map<int, const char*>& UnwindStruct_X86::regname_map = X86_REG_NAME_MAP;
-
+const std::vector<int>& UnwindStruct_X86::callee_save_regs = *new std::vector<int>();
 
 struct UnwindStruct_AARCH64 {
   static const int reg_count = AARCH64_REG_COUNT;
@@ -393,8 +385,12 @@ struct UnwindStruct_AARCH64 {
   static const int ip_regno = AARCH64_IP;
   static const int sp_regno = AARCH64_SP;
   using word_t = uint64_t;
+  static const int PC_ADVANCE = 1;
+  static const std::vector<int>& callee_save_regs;
 };
 const std::unordered_map<int, const char*>& UnwindStruct_AARCH64::regname_map = AARCH64_REG_NAME_MAP;
+const std::vector<int>& UnwindStruct_AARCH64::callee_save_regs = *new std::vector<int>({
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28});
 
 struct UnwindStruct_ARM {
   static const int reg_count = ARM_REG_COUNT;
@@ -402,8 +398,11 @@ struct UnwindStruct_ARM {
   static const int ip_regno = ARM_LR;
   static const int sp_regno = ARM_SP;
   using word_t = uint32_t;
+  static const int PC_ADVANCE = 8;
+  static const std::vector<int>& callee_save_regs;
 };
 const std::unordered_map<int, const char*>& UnwindStruct_ARM::regname_map = ARM_REG_NAME_MAP;
+const std::vector<int>& UnwindStruct_ARM::callee_save_regs = *new std::vector<int>({4, 5, 6, 7, 8, 10, 11});
 
 extern "C" void GetCurrentRegs(void* mc);
 
@@ -421,12 +420,18 @@ bool UnwindInner() {
 
   GetCurrentRegs(current_regs);
 
+  word_t* p = current_regs;
+  for (int i = 0; i < 32; ++i) {
+    D("stack[0x%" PRIx64 "] = 0x%" PRIx64 "\n", static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)), static_cast<uint64_t>(*p));
+    p++;
+  }
   RegValue<word_t> reg_values[MAX_REGS];
 
   for (int i = 0; i < UnwindStruct::reg_count; ++i) {
     reg_values[i].SetValue(current_regs[i]);
     D("reg[%s] = 0x%" PRIx64 "\n", FindMap(UnwindStruct::regname_map, i), static_cast<uint64_t>(reg_values[i].value));
   }
+  reg_values[UnwindStruct::ip_regno].SetValue(current_regs[UnwindStruct::ip_regno] - UnwindStruct::PC_ADVANCE);
 
   MapTree map_tree;
   map_tree.UpdateMaps();
@@ -434,7 +439,7 @@ bool UnwindInner() {
   RegValue<word_t> reg_values2[MAX_REGS];
   RegValue<word_t>* rp1 = reg_values;
   RegValue<word_t>* rp2 = reg_values2;
-  CFAExecutor<word_t> executor(UnwindStruct::sp_regno);
+  CFAExecutor<word_t> executor(UnwindStruct::sp_regno, UnwindStruct::callee_save_regs);
   while (rp1[UnwindStruct::ip_regno].valid) {
     word_t ip = rp1[UnwindStruct::ip_regno].value;
     printf("ip 0x%" PRIx64 "\n", static_cast<uint64_t>(ip));
@@ -453,7 +458,7 @@ bool UnwindInner() {
     }
     word_t vaddr_in_file = ip - map->start + map->dso_reader->GetMinVaddr();
     D("vaddr_in_file = 0x%" PRIx64 "\n", static_cast<uint64_t>(vaddr_in_file));
-    if (!map->dso_reader->ReadEhFrame()) {
+    if (!map->dso_reader->ReadUnwindSection()) {
       return false;
     }
     Fde* fde = map->dso_reader->GetFdeForVaddrInFile(vaddr_in_file);

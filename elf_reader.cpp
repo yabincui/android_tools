@@ -8,9 +8,14 @@
 #include <unistd.h>
 
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <7zCrc.h>
+#include <Xz.h>
+#include <XzCrc64.h>
 
 #include "dwarf.h"
 #include "dwarf_string.h"
@@ -59,6 +64,54 @@ static std::string GetProgramHeaderFlags(int flags) {
   return result;
 }
 
+class FileReadHelper : public ReadHelper {
+ public:
+  FileReadHelper(FILE* fp, const char* filename)
+      : ReadHelper(filename), fp_(fp), fd_(fileno(fp)) {
+  }
+
+  ~FileReadHelper() {
+    fclose(fp_);
+  }
+
+  bool ReadFully(void* buf, size_t size, size_t offset) override {
+    ssize_t rc = TEMP_FAILURE_RETRY(pread64(fd_, buf, size, offset));
+    if (rc < 0) {
+      fprintf(stderr, "failed to read file %s: %s\n", GetName(), strerror(errno));
+      return false;
+    }
+    if (static_cast<size_t>(rc) != size) {
+      fprintf(stderr, "requested to read %s for %zu bytes, only get %zd bytes\n",
+              GetName(), size, rc);
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  FILE* fp_;
+  int fd_;
+};
+
+class MemReadHelper : public ReadHelper {
+ public:
+  MemReadHelper(const std::vector<char>& data, const char* mem_name)
+    : ReadHelper(mem_name), data_(data) {
+  }
+
+  bool ReadFully(void* buf, size_t size, size_t offset) override {
+    if (offset >= data_.size() || offset + size < offset || offset + size > data_.size()) {
+      fprintf(stderr, "failed to read file %s\n", GetName());
+      return false;
+    }
+    memcpy(buf, data_.data() + offset, size);
+    return true;
+  }
+
+ private:
+  const std::vector<char> data_;
+};
+
 
 struct Elf64Struct {
   using Elf_Ehdr = Elf64_Ehdr;
@@ -81,14 +134,9 @@ class ElfReaderImpl : public ElfReader {
   using Elf_Shdr = typename ElfStruct::Elf_Shdr;
   using Elf_Phdr = typename ElfStruct::Elf_Phdr;
 
-  ElfReaderImpl(FILE* fp, const char* filename, int log_flag)
-      : ElfReader(filename),
-        fp_(fp), fd_(fileno(fp_)), log_flag_(log_flag),
+  ElfReaderImpl(std::unique_ptr<ReadHelper> read_helper, int log_flag)
+      : read_helper_(std::move(read_helper)), log_flag_(log_flag),
         read_section_flag_(0) {
-  }
-
-  virtual ~ElfReaderImpl() {
-    fclose(fp_);
   }
 
   bool Is64() const {
@@ -96,6 +144,8 @@ class ElfReaderImpl : public ElfReader {
   }
 
   bool ReadEhFrame() override;
+  bool ReadDebugFrame() override;
+  bool ReadGnuDebugData() override;
 
  protected:
   bool ReadHeader() override {
@@ -109,7 +159,7 @@ class ElfReaderImpl : public ElfReader {
     int elf_class = header_.e_ident[EI_CLASS];
     if (elf_class != ElfStruct::ELFCLASS) {
       fprintf(stderr, "%s is %d-bit elf, doesn't match expected\n",
-              filename_.c_str(), elf_class == ELFCLASS32 ? 32 : 64);
+              read_helper_->GetName(), elf_class == ELFCLASS32 ? 32 : 64);
       return false;
     }
     if (log_flag_ & LOG_HEADER) {
@@ -192,18 +242,13 @@ class ElfReaderImpl : public ElfReader {
     return min_vaddr;
   }
 
+  bool HasSection(const char* name) override {
+    return GetSection(name) != nullptr;
+  }
+
  private:
   bool ReadFully(void* buf, size_t size, size_t offset) {
-    ssize_t rc = TEMP_FAILURE_RETRY(pread64(fd_, buf, size, offset));
-    if (rc < 0) {
-      fprintf(stderr, "failed to read file: %s\n", strerror(errno));
-      return false;
-    }
-    if (static_cast<size_t>(rc) != size) {
-      fprintf(stderr, "not read fully\n");
-      return false;
-    }
-    return true;
+    return read_helper_->ReadFully(buf, size, offset);
   }
 
   const Elf_Shdr* GetSection(const char* name) {
@@ -211,7 +256,7 @@ class ElfReaderImpl : public ElfReader {
     if (it != sec_headers_.end()) {
       return &it->second;
     }
-    fprintf(stderr, "No %s section in %s\n", name, filename_.c_str());
+    fprintf(stderr, "No %s section in %s\n", name, read_helper_->GetName());
     return nullptr;
   }
 
@@ -223,8 +268,9 @@ class ElfReaderImpl : public ElfReader {
     return data;
   }
 
-  FILE* fp_;
-  int fd_;
+  bool ReadEhOrDebugFrame(const Elf_Shdr* sec, const std::vector<char>& data, bool is_eh_frame);
+
+  std::unique_ptr<ReadHelper> read_helper_;
   int log_flag_;
   int read_section_flag_;
   Elf_Ehdr header_;
@@ -243,12 +289,114 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
     return false;
   }
   std::vector<char> eh_frame_data = ReadSection(eh_frame_sec);
-  const char* begin = eh_frame_data.data();
-  const char* end = begin + eh_frame_data.size();
+  if (!ReadEhOrDebugFrame(eh_frame_sec, eh_frame_data, true)) {
+    return false;
+  }
+  read_section_flag_ |= READ_EH_FRAME_SECTION;
+  return true;
+}
+
+template <typename ElfStruct>
+bool ElfReaderImpl<ElfStruct>::ReadDebugFrame() {
+  if (read_section_flag_ & READ_DEBUG_FRAME_SECTION) {
+    return true;
+  }
+  const Elf_Shdr* debug_frame_sec = GetSection(".debug_frame");
+  if (debug_frame_sec == nullptr) {
+    return false;
+  }
+  std::vector<char> debug_frame_data = ReadSection(debug_frame_sec);
+  if (!ReadEhOrDebugFrame(debug_frame_sec, debug_frame_data, false)) {
+    return false;
+  }
+  read_section_flag_ |= READ_DEBUG_FRAME_SECTION;
+  return true;
+}
+
+static void* xz_alloc(void*, size_t size) {
+  return malloc(size);
+}
+
+static void xz_free(void*, void* address) {
+  free(address);
+}
+
+static bool XzDecompress(const std::vector<char>& compressed_data, std::vector<char>* decompressed_data) {
+  ISzAlloc alloc;
+  CXzUnpacker state;
+  alloc.Alloc = xz_alloc;
+  alloc.Free = xz_free;
+  XzUnpacker_Construct(&state, &alloc);
+  CrcGenerateTable();
+  Crc64GenerateTable();
+  size_t src_offset = 0;
+  size_t dst_offset = 0;
+  std::vector<char> dst(compressed_data.size(), ' ');
+
+  ECoderStatus status = CODER_STATUS_NOT_FINISHED;
+  while (status == CODER_STATUS_NOT_FINISHED) {
+    dst.resize(dst.size() * 2);
+    size_t src_remaining = compressed_data.size() - src_offset;
+    size_t dst_remaining = dst.size() - dst_offset;
+    int res = XzUnpacker_Code(&state, reinterpret_cast<Byte*>(&dst[dst_offset]), &dst_remaining,
+                              reinterpret_cast<const Byte*>(&compressed_data[src_offset]),
+                              &src_remaining, CODER_FINISH_ANY, &status);
+    if (res != SZ_OK) {
+      fprintf(stderr, "LZMA decompression failed with error %d\n", res);
+      XzUnpacker_Free(&state);
+      return false;
+    }
+    src_offset += src_remaining;
+    dst_offset += dst_remaining;
+  }
+  XzUnpacker_Free(&state);
+  if (!XzUnpacker_IsStreamWasFinished(&state)) {
+    fprintf(stderr, "LZMA decompresstion failed due to incomplete stream\n");
+    return false;
+  }
+  dst.resize(dst_offset);
+  *decompressed_data = std::move(dst);
+  return true;
+}
+
+template <typename ElfStruct>
+bool ElfReaderImpl<ElfStruct>::ReadGnuDebugData() {
+  if (read_section_flag_ & READ_GNU_DEBUG_DATA_SECTION) {
+    return true;
+  }
+  const Elf_Shdr* gnu_debugdata_sec = GetSection(".gnu_debugdata");
+  if (gnu_debugdata_sec == nullptr) {
+    return false;
+  }
+  std::vector<char> gnu_debugdata = ReadSection(gnu_debugdata_sec);
+  std::vector<char> decompressed_data;
+  if (!XzDecompress(gnu_debugdata, &decompressed_data)) {
+    fprintf(stderr, "failed to decompress .gnu_debugdata of %s\n", read_helper_->GetName());
+    return false;
+  }
+  std::string mem_name = std::string(".gnu_debugdata_in_") + read_helper_->GetName();
+  std::unique_ptr<ElfReader> reader = ElfReader::OpenMem(decompressed_data, mem_name.c_str(), log_flag_);
+  if (reader == nullptr) {
+    fprintf(stderr, "can't read elf file %s\n", mem_name.c_str());
+    return false;
+  }
+  if (!reader->ReadDebugFrame()) {
+    return false;
+  }
+  ElfReaderImpl<ElfStruct>* p = reinterpret_cast<ElfReaderImpl<ElfStruct>*>(reader.get());
+  cie_table_ = std::move(p->cie_table_);
+  fde_table_ = std::move(p->fde_table_);
+  read_section_flag_ |= READ_GNU_DEBUG_DATA_SECTION;
+  return true;
+}
+
+template <typename ElfStruct>
+bool ElfReaderImpl<ElfStruct>::ReadEhOrDebugFrame(const Elf_Shdr* sec, const std::vector<char>& data, bool is_eh_frame) {
+  const char* begin = data.data();
+  const char* end = begin + data.size();
   const char* p;
-  bool is_eh_frame = true;
   if (log_flag_ & LOG_EH_FRAME_SECTION) {
-    printf(".eh_frame:\n");
+    printf("%s of %s:\n", is_eh_frame ? ".eh_frame" : ".debug_frame", read_helper_->GetName());
     CieTable cie_table;
     for (p = begin; p < end;) {
       const char* cie_begin = p;
@@ -346,7 +494,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
                initial_location, address_range);
         uint64_t proc_start = initial_location;
         if ((cie->fde_pointer_encoding & 0x70) == DW_EH_PE_pcrel) {
-          proc_start += eh_frame_sec->sh_addr + (base - begin);
+          proc_start += sec->sh_addr + (base - begin);
         }
         printf("proc range [0x%" PRIx64 " - 0x%" PRIx64 "]\n", proc_start, proc_start + address_range);
         current_loc = proc_start;
@@ -595,7 +743,7 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
       uint64_t address_range = ReadEhEncoding(p, cie->fde_pointer_encoding, Is64());
       uint64_t proc_start = initial_location;
       if ((cie->fde_pointer_encoding & 0x70) == DW_EH_PE_pcrel) {
-        proc_start += eh_frame_sec->sh_addr + (base - begin);
+        proc_start += sec->sh_addr + (base - begin);
       }
       Fde* fde = fde_table_.CreateFde(proc_start);
       fde->cie = cie;
@@ -614,33 +762,43 @@ bool ElfReaderImpl<ElfStruct>::ReadEhFrame() {
     }
     p = cie_end;
   }
-  read_section_flag_ |= READ_EH_FRAME_SECTION;
   return true;
 }
 
-std::unique_ptr<ElfReader> ElfReader::Create(const char* filename, int log_flag) {
+std::unique_ptr<ElfReader> ElfReader::OpenFile(const char* filename, int log_flag) {
   FILE* fp = fopen(filename, "rb");
   if (fp == nullptr) {
     fprintf(stderr, "failed to open %s\n", filename);
     return nullptr;
   }
+  std::unique_ptr<ReadHelper> read_helper(new FileReadHelper(fp, filename));
+  return Open(std::move(read_helper), log_flag);
+}
+
+std::unique_ptr<ElfReader> ElfReader::OpenMem(const std::vector<char>& data,
+                                              const char* mem_name, int log_flag) {
+  std::unique_ptr<ReadHelper> read_helper(new MemReadHelper(data, mem_name));
+  return Open(std::move(read_helper), log_flag);
+}
+
+std::unique_ptr<ElfReader> ElfReader::Open(std::unique_ptr<ReadHelper> read_helper,
+                                           int log_flag) {
   char buf[EI_NIDENT];
-  if (fread(buf, sizeof(buf), 1, fp) != 1) {
-    fprintf(stderr, "failed to read %s\n", filename);
+  if (!read_helper->ReadFully(buf, sizeof(buf), 0)) {
     return nullptr;
   }
   if (memcmp(buf, ELFMAG, SELFMAG) != 0) {
-    fprintf(stderr, "elf magic doesn't match\n");
+    fprintf(stderr, "elf magic is not correct in file %s\n", read_helper->GetName());
     return nullptr;
   }
   int elf_class = buf[EI_CLASS];
   std::unique_ptr<ElfReader> result;
   if (elf_class == ELFCLASS64) {
-    result.reset(new ElfReaderImpl<Elf64Struct>(fp, filename, log_flag));
+    result.reset(new ElfReaderImpl<Elf64Struct>(std::move(read_helper), log_flag));
   } else if (elf_class == ELFCLASS32) {
-    result.reset(new ElfReaderImpl<Elf32Struct>(fp, filename, log_flag));
+    result.reset(new ElfReaderImpl<Elf32Struct>(std::move(read_helper), log_flag));
   } else {
-    fprintf(stderr, "wrong elf class\n");
+    fprintf(stderr, "wrong elf class in %s\n", read_helper->GetName());
     return nullptr;
   }
   if (!result->ReadHeader() || !result->ReadSecHeaders() ||
@@ -659,6 +817,6 @@ ElfReader* ElfReaderManager::OpenElf(const std::string& filename) {
   if (it != reader_table_.end()) {
     return it->second.get();
   }
-  reader_table_[filename] = ElfReader::Create(filename.c_str(), 0);
+  reader_table_[filename] = ElfReader::OpenFile(filename.c_str(), 0);
   return reader_table_[filename].get();
 }

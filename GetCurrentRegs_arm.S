@@ -23,6 +23,7 @@ GetCurrentRegs:
   .cfi_startproc
 
   stmib r0, {r0-r12}
+  mov r1, sp
   str r1, [r0, ARM_SP]
   add r1, lr, #4
   str r1, [r0, ARM_LR]

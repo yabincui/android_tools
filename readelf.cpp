@@ -4,7 +4,7 @@
 #include "elf_reader.h"
 
 bool ReadElf(const char* filename) {
-  std::unique_ptr<ElfReader> reader = ElfReader::Create(filename, -1);
+  std::unique_ptr<ElfReader> reader = ElfReader::OpenFile(filename, -1);
   if (!reader->ReadEhFrame()) {
     return false;
   }
