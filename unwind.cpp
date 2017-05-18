@@ -10,7 +10,7 @@
 #include "map.h"
 #include "read_utils.h"
 
-#define DEBUG_UNWIND
+#undef DEBUG_UNWIND
 
 #if defined(DEBUG_UNWIND)
 #define D(format, ...) \

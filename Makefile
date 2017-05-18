@@ -1,4 +1,4 @@
-all: app test_exception read_cfi unwind unwind32 readelf
+all: app test_exception read_cfi #unwind unwind32 readelf
 
 app: throw.cpp cxxabi.cpp main.c Makefile
 	g++ -c -o throw.o -O0 -ggdb throw.cpp
@@ -16,7 +16,7 @@ test_exception: test_exception.cpp test_exception_lib.cpp Makefile
 
 	
 read_cfi: read_cfi.cpp Makefile dwarf_string.h
-	g++ -std=c++11 -o read_cfi read_cfi.cpp
+	g++ -g -std=c++11 -o read_cfi read_cfi.cpp
 
 readelf: readelf.o elf_reader.o
 	g++ -std=c++11 -o $@ $^

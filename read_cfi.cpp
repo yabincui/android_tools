@@ -10,12 +10,15 @@
 #include <string>
 #include <vector>
 
+#include "arm_exception.h"
 #include "dwarf.h"
 #include "dwarf_string.h"
 
 #define DEBUG_CFI
 
 #define ElfW(what) Elf64_## what
+
+static bool is64 = true;
 
 #define CHECK(expr) \
   if (!(expr)) \
@@ -41,6 +44,22 @@ static int64_t ReadLEB128(const char*& p) {
 }
 
 static uint64_t ReadULEB128(const char*& p) {
+  uint64_t result = 0;
+  uint64_t tmp;
+  int shift = 0;
+  while (*p & 0x80) {
+    tmp = *p & 0x7f;
+    result |= tmp << shift;
+    shift += 7;
+    p++;
+  }
+  tmp = *p;
+  result |= tmp << shift;
+  p++;
+  return result;
+}
+
+static uint64_t ReadULEB128(const uint8_t*& p) {
   uint64_t result = 0;
   uint64_t tmp;
   int shift = 0;
@@ -91,6 +110,8 @@ static const char* ReadStr(const char*& p) {
 static uint64_t ReadEhEncoding(const char*& p, uint8_t encoding) {
   encoding &= 0x0f;
   switch (encoding) {
+    case DW_EH_PE_absptr:
+      return Read(p, is64 ? 8 : 4);
     case DW_EH_PE_omit:
       return 0;
     case DW_EH_PE_uleb128:
@@ -112,6 +133,54 @@ static uint64_t ReadEhEncoding(const char*& p, uint8_t encoding) {
   }
   fprintf(stderr, "ReadEhEncoding: unsupported 0x%x\n", encoding);
   abort();
+}
+
+static uint64_t ReadEhEncoding(const char*& p, uint8_t encoding, uint64_t eh_hdr_vaddr, const char* begin) {
+  const char* init_addr = p;
+  uint64_t res = 0;
+  switch (encoding & 0x0f) {
+    case DW_EH_PE_absptr:
+      res = Read(p, is64 ? 8 : 4);
+      break;
+    case DW_EH_PE_omit:
+      res = 0;
+      break;
+    case DW_EH_PE_uleb128:
+      res = ReadULEB128(p);
+      break;
+    case DW_EH_PE_udata2:
+      res = Read(p, 2);
+      break;
+    case DW_EH_PE_udata4:
+      res = Read(p, 4);
+      break;
+    case DW_EH_PE_udata8:
+      res = Read(p, 8);
+      break;
+    case DW_EH_PE_sleb128:
+      res = ReadLEB128(p);
+      break;
+    case DW_EH_PE_sdata2:
+      res = ReadS(p, 2);
+      break;
+    case DW_EH_PE_sdata4:
+      res = ReadS(p, 4);
+      break;
+    case DW_EH_PE_sdata8:
+      res = ReadS(p, 8);
+      break;
+  }
+  switch (encoding & 0xf0) {
+    case DW_EH_PE_pcrel:
+      res += p - begin + eh_hdr_vaddr;
+      break;
+    case DW_EH_PE_datarel:
+      res += eh_hdr_vaddr;
+      break;
+  }
+  return res;
+  //fprintf(stderr, "ReadEhEncoding: unsupported 0x%x\n", encoding);
+  //abort();
 }
 
 static void PrintHex(const char* p, uint64_t len) {
@@ -209,6 +278,8 @@ class ElfReader {
   static const int READ_DEBUG_STR_SECTION = 2;
   static const int READ_DEBUG_INFO_SECTION = 4;
   static const int READ_EH_FRAME_SECTION = 8;
+  static const int READ_DEBUG_FRAME_SECTION = 16;
+  static const int READ_EH_FRAME_HDR_SECTION = 32;
 
  public:
   static const int LOG_HEADER = 1;
@@ -518,20 +589,71 @@ class ElfReader {
     return true;
   }
 
+  bool ReadEhFrameHdrSection() {
+    if (read_section_flag_ & READ_EH_FRAME_HDR_SECTION) {
+      return true;
+    }
+    read_section_flag_ |= READ_EH_FRAME_HDR_SECTION;
+    const ElfW(Shdr)* eh_hdr_sec = GetSection(".eh_frame_hdr");
+    if (eh_hdr_sec == nullptr) {
+      return false;
+    }
+    uint64_t eh_hdr_vaddr = eh_hdr_sec->sh_addr;
+    std::vector<char> frame_data = ReadSection(eh_hdr_sec);
+    const char* begin = frame_data.data();
+    const char* p = begin;
+    const char* end = p + frame_data.size();
+    printf(".eh_frame_hdr:\n");
+    uint8_t version = *p++;
+    printf("version = %d\n", version);
+    uint8_t eh_frame_ptr_enc = *p++;
+    printf("eh_frame_ptr_enc = 0x%x\n", eh_frame_ptr_enc);
+    uint8_t fde_count_enc = *p++;
+    printf("fde_count_enc = 0x%x\n", fde_count_enc);
+    uint8_t table_enc = *p++;
+    printf("table_enc = 0x%x\n", table_enc);
+    uint64_t eh_frame_ptr = ReadEhEncoding(p, eh_frame_ptr_enc, eh_hdr_vaddr, begin);
+    printf("eh_frame_ptr = 0x%" PRIx64 "\n", eh_frame_ptr);
+    uint64_t fde_count = ReadEhEncoding(p, fde_count_enc, eh_hdr_vaddr, begin);
+    printf("fde_count = %" PRIu64 "\n", fde_count);
+    for (uint64_t i = 0; i < fde_count; ++i) {
+      uint64_t init_loc = ReadEhEncoding(p, table_enc, eh_hdr_vaddr, begin);
+      uint64_t addr = ReadEhEncoding(p, table_enc, eh_hdr_vaddr, begin);
+      printf("init_loc = 0x%" PRIx64 ", addr = 0x%" PRIx64 "\n", init_loc, addr);
+    }
+    return true;
+  }
+
   bool ReadEhFrameSection() {
     if (read_section_flag_ & READ_EH_FRAME_SECTION) {
       return true;
     }
+    read_section_flag_ |= READ_EH_FRAME_SECTION;
     const ElfW(Shdr)* eh_frame_sec = GetSection(".eh_frame");
     if (eh_frame_sec == nullptr) {
       return false;
     }
-    std::vector<char> eh_frame_data = ReadSection(eh_frame_sec);
-    const char* begin = eh_frame_data.data();
-    const char* end = begin + eh_frame_data.size();
+    return ReadEhOrDebugFrameSection(true, eh_frame_sec);
+  }
+
+  bool ReadDebugFrameSection() {
+    if (read_section_flag_ & READ_DEBUG_FRAME_SECTION) {
+      return true;
+    }
+    read_section_flag_ |= READ_DEBUG_FRAME_SECTION;
+    const ElfW(Shdr)* debug_frame_sec = GetSection(".debug_frame");
+    if (debug_frame_sec == nullptr) {
+      return false;
+    }
+    return ReadEhOrDebugFrameSection(false, debug_frame_sec);
+  }
+
+  bool ReadEhOrDebugFrameSection(bool is_eh_frame, const ElfW(Shdr)* frame_sec) {
+    std::vector<char> frame_data = ReadSection(frame_sec);
+    const char* begin = frame_data.data();
+    const char* end = begin + frame_data.size();
     const char* p = begin;
-    bool is_eh_frame = true;
-    printf(".eh_frame:\n");
+    printf(".%s:\n", is_eh_frame ? "eh_frame" : "debug_frame");
     CieTable cie_table;
     while (p < end) {
       const char* cie_begin = p;
@@ -628,7 +750,7 @@ class ElfReader {
                initial_location, address_range);
         uint64_t proc_start = initial_location;
         if ((cie->fde_pointer_encoding & 0x70) == DW_EH_PE_pcrel) {
-          proc_start += eh_frame_sec->sh_addr + (base - begin);
+          proc_start += frame_sec->sh_addr + (base - begin);
         }
         printf("proc range [0x%" PRIx64 " - 0x%" PRIx64 "]\n", proc_start, proc_start + address_range);
         if (cie->augmentation[0] == 'z') {
@@ -792,9 +914,11 @@ class ElfReader {
     read_section_flag_ |= READ_EH_FRAME_SECTION;
     return true;
   }
+  bool ReadArmExceptionSection();
 
  private:
   bool ReadHeader() {
+    memset(&header_, 0, sizeof(header_));
     if (!ReadFully(&header_, sizeof(header_), 0)) {
       return false;
     }
@@ -804,7 +928,7 @@ class ElfReader {
     }
     int elf_class = header_.e_ident[EI_CLASS];
     if (elf_class != ELFCLASS64) {
-      fprintf(stderr, "elf format is 32-bit\n");
+      fprintf(stderr, "elf format is 32-bit, elf_class = %x\n", elf_class);
       return false;
     }
     if (log_flags_ & LOG_HEADER) {
@@ -1046,44 +1170,168 @@ class ElfReader {
   std::vector<char> debug_str_data_;
 };
 
-/*
-bool readEhFrameHdr(FILE* fp, ElfW(Shdr)* section) {
-  char data[section->sh_size];
-  if (!ReadFully(fp, data, section->sh_size, section->sh_offset)) {
+static void ParseArmExInsts(const uint8_t* p, size_t len) {
+  const uint8_t* end = p + len;
+  uint32_t vsp = 0;
+  while (p < end) {
+    uint8_t c = *p++;
+    if ((c & 0xc0) == 0) {
+      uint32_t offset = ((c & 0x3f) << 2) + 4;
+      printf("vsp = vsp + 0x%x\n", offset);
+    } else if ((c & 0xc0) == 0x40) {
+      uint32_t offset = ((c & 0x3f) << 2) + 4;
+      printf("vsp = vsp - 0x%x\n", offset);
+    } else if (c == 0x80 && p < end && *p == 0x00) {
+      printf("Refuse to Unwind\n");
+      p++;
+    } else if ((c & 0xf0) == 0x80 && p < end && (c != 0x80 || *p != 0)) {
+      int pop_reg[16];
+      for (int i = 15; i >= 12; --i) {
+        pop_reg[i] = (c & (1<<(i-12)));
+      }
+      uint8_t second = *p;
+      for (int i = 11; i >= 4; --i) {
+        pop_reg[i] = second & (1<<(i-4));
+      }
+      printf("pop {");
+      for (int i = 15; i >= 4; --i) {
+        if (pop_reg[i]) {
+          printf(" r%d", i);
+        }
+      }
+      printf("}\n");
+      p++;
+    } else if ((c & 0xf0) == 0x90 && (c & 0x0f) != 13 && (c & 0x0f) != 15) {
+      printf("vsp = r%d\n", c & 0x0f);
+    } else if (c == 0x9d) {
+      abort(); // prefix for arm reg
+    } else if (c == 0x9f) {
+      abort();
+    } else if ((c & 0xf8) == 0xa0) {
+      uint8_t to = c & 0x07;
+      printf("pop {r4-r%d}\n", to + 4);
+    } else if ((c & 0xf8) == 0xa8) {
+      uint8_t to = c & 0x07;
+      printf("pop {r4-r%d, r14}\n", to + 4);
+    } else if (c == 0xb0) {
+      printf("Finish\n");
+    } else if (c == 0xb1 && p < end && *p == 0) {
+      abort(); // spare
+    } else if (c == 0xb1 && p < end && (*p & 0xf0) == 0) {
+      int pop_reg[3];
+      for (int i = 0; i <= 3; ++i) {
+        pop_reg[i] = *p & (1<<i);
+      }
+      printf("pop {");
+      for (int i = 3; i >= 0; --i) {
+        if (pop_reg[i]) {
+          printf(" r%d", i);
+        }
+      }
+      printf("}\n");
+      p++;
+    } else if (c == 0xb1 && p < end && (*p & 0xf0) != 0) {
+      abort(); // spare
+    } else if (c == 0xb2) {
+      uint64_t value = ReadULEB128(p);
+      value = (value << 2) + 0x204;
+      printf("vsp = vsp + 0x%" PRIx64 "\n", value);
+    } else if (c == 0xc9 && p < end) {
+      uint8_t from = (*p >> 4) & 0x0f;
+      uint8_t dis = *p & 0x0f;
+      printf("pop VFP D%d to D%d\n", from, from + dis);
+      p++;
+    } else {
+      printf("unknown c = %x\n", c);
+      abort();
+    }
+  }
+}
+
+bool ElfReader::ReadArmExceptionSection() {
+  printf("ReadArmExceptionSection\n");
+  const ElfW(Shdr)* exidx_sec = GetSection(".ARM.exidx");
+  if (exidx_sec == nullptr) {
     return false;
   }
-  printf("eh_frame_hdr: addr %lx offset %lx, size %lx\n",
-         (unsigned long)section->sh_addr, (unsigned long)section->sh_offset,
-         (unsigned long)section->sh_size);
-  printf(" version: %d\n", data[0]);
-  printf(" eh_frame_ptr_enc: %x\n", data[1]);
-  printf(" fde_count_enc: %x\n", data[2]);
-  printf(" table_enc: %x\n", data[3]);
-  char eh_frame_ptr_enc = data[1];
-  if ((eh_frame_ptr_enc & 0x0f) != 0x0b) {
+  const ElfW(Shdr)* extab_sec = GetSection(".ARM.extab");
+  if (extab_sec == nullptr) {
     return false;
   }
-  int32_t eh_frame_ptr = *(int32_t*)(&data[4]);
-  printf("eh_frame_ptr = %x\n", eh_frame_ptr);
-  char fde_count_enc = data[2];
-  if ((fde_count_enc & 0x0f) != 0x03) {
-    return false;
-  }
-  uint32_t fde_count = *(uint32_t*)(&data[8]);
-  printf("fde_count = %u\n", fde_count);
-  char table_enc = data[3];
-  if (table_enc != 0x3b) {
-    return false;
-  }
-  int32_t* p = (int32_t*)&data[12];
-  for (int i = 0; i < fde_count; ++i) {
-    int32_t loc = *p++;
-    int32_t addr = *p++;
-    printf("table[%d], loc %x, addr %x\n", i, loc, addr);
+  std::vector<char> exidx_data = ReadSection(exidx_sec);
+  std::vector<char> extab_data = ReadSection(extab_sec);
+  const uint32_t* begin = (const uint32_t*)exidx_data.data();
+  const uint32_t* end = (const uint32_t*)(exidx_data.data() + exidx_data.size());
+  const uint32_t* p = begin;
+  const uint32_t* tab_begin = (const uint32_t*)extab_data.data();
+  printf(".ARM.exidx:\n");
+  int entry_idx = 0;
+  for (;p < end; p += 2, entry_idx++) {
+    uint32_t func_addr = (p - begin) * sizeof(uint32_t) + exidx_sec->sh_addr + *p;
+    func_addr &= 0x7fffffff;
+    printf("entry %d: first 0x%x, second 0x%x, function 0x%x\n", entry_idx, *p, *(p+1), func_addr);
+    uint32_t second = *(p+1);
+    if (second == EXIDX_CANTUNWIND) {
+      printf("can't unwind this function\n");
+    } else if (second >> 31) {
+      printf("compressed insts: 0x%x, 0x%x, 0x%x\n", (second >> 16) & 0xff, (second >> 8) & 0xff, second & 0xff);
+      uint8_t buf[3];
+      buf[0] = (second >> 16) & 0xff;
+      buf[1] = (second >> 8) & 0xff;
+      buf[2] = second & 0xff;
+      ParseArmExInsts(buf, 3);
+    } else {
+      uint32_t vaddr = (p  + 1 - begin) * sizeof(uint32_t) + exidx_sec->sh_addr + second;
+      uint32_t offset = (vaddr - extab_sec->sh_addr) & 0x7fffffff;
+      if (offset >= extab_data.size()) {
+        printf("offset %x >= extab size %x, exit\n", offset, (uint32_t)extab_data.size());
+        continue;
+      }
+      printf("connect to .ARM.extab in vaddr 0x%x, extab_sec vaddr 0x%x, offset 0x%x\n", vaddr, extab_sec->sh_addr, offset);
+      const uint32_t* q = (offset >> 2) + tab_begin;
+      printf("value = 0x%x\n", *q);
+      uint32_t value = *q;
+      int buf_len = 3;
+      uint8_t c = value >> 24;
+      int word_len = 0;
+      if ((c & 0x80) == 0) {
+        printf("not in compact mode\n");
+      } else {
+        if (c != 0x81) {
+          abort();
+        }
+        if (c & 0x7f) {
+          word_len = (value >> 16) & 0xff;
+          buf_len = 2 + word_len * 4;
+        }
+        uint8_t buf[buf_len];
+        if (buf_len == 3) {
+          buf[0] = (value >> 16) & 0xff;
+          buf[1] = (value >> 8) & 0xff;
+          buf[2] = value & 0xff;
+        } else {
+          buf[0] = (value >> 8) & 0xff;
+          buf[1] = value & 0xff;
+          int t = 2;
+          for (int i = 0; i < word_len; ++i) {
+            value = *++q;
+            buf[t++] = (value >> 24) & 0xff;
+            buf[t++] = (value >> 16) & 0xff;
+            buf[t++] = (value >> 8) & 0xff;
+            buf[t++] = value & 0xff;
+          }
+        }
+        for (int i = 0; i < buf_len; ++i) {
+          printf("buf[%d] = %x\n", i, buf[i]);
+        }
+        ParseArmExInsts(buf, buf_len);
+      }
+    }
   }
   return true;
 }
-*/
+
+bool only_debug_frame = false;
 
 bool ReadElf(const char* filename) {
   int log_flag = ElfReader::LOG_HEADER | ElfReader::LOG_SECTION_HEADERS | ElfReader::LOG_DEBUG_ABBREV_SECTION;
@@ -1091,21 +1339,45 @@ bool ReadElf(const char* filename) {
   if (!reader.Open()) {
     return false;
   }
+  /*
   if (!reader.ReadDebugInfoSection()) {
     fprintf(stderr, "can't read .debug_info\n");
   }
+  */
+  if (!only_debug_frame) {
+  if (!reader.ReadEhFrameHdrSection()) {
+    fprintf(stderr, "failed to read .eh_frame_hdr\n");
+  }
   if (!reader.ReadEhFrameSection()) {
+    fprintf(stderr, "failed to read .eh_frame\n");
+  }
+  }
+  if (!reader.ReadDebugFrameSection()) {
+    fprintf(stderr, "failed to read .debug_frame\n");
+  }
+  if (!only_debug_frame) {
+  if (!reader.ReadArmExceptionSection()) {
     return false;
+  }
   }
   return true;
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
+  int i = 0;
+  for (i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--only-debug-frame")== 0) {
+      only_debug_frame = true;
+    } else {
+      break;
+    }
+  }
+  if (i == argc) {
     fprintf(stderr, "no filename\n");
     exit(1);
   }
-  const char* filename = argv[1];
+  const char* filename = argv[i];
+  printf("filename = %s\n", filename);
   ReadElf(filename);
   return 0;
 }
